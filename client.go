@@ -8,15 +8,22 @@ import (
 	"time"
 )
 
+const (
+	defBufferSiZe = 50
+)
+
+// buffer is a list of the last N push notification messages
 type buffer struct {
 	size int
 	*list.List
 }
 
+// newBuffer return a buffer of the last <size> notification
 func newBuffer(size int) *buffer {
 	return &buffer{size, list.New()}
 }
 
+// Add pushes a Notification into the buffer
 func (b *buffer) Add(v interface{}) *list.Element {
 	e := b.PushBack(v)
 
@@ -27,11 +34,16 @@ func (b *buffer) Add(v interface{}) *list.Element {
 	return e
 }
 
+// Client maintains a connection to APNS server & is used to send notifications
 type Client struct {
+	// Conn is the underlying connection to APNS
 	Conn         *Conn
+	// FailedNotifs is a channel for receiving failed notifications
 	FailedNotifs chan NotificationResult
 
+	// incoming notification send request
 	notifs chan Notification
+	// id of the current notification request
 	id     uint32
 }
 
@@ -48,12 +60,14 @@ func newClientWithConn(gw string, conn Conn) Client {
 	return c
 }
 
+// NewClientWithCert returns a new APNS client, given a TLS certificate
 func NewClientWithCert(gw string, cert tls.Certificate) Client {
 	conn := NewConnWithCert(gw, cert)
 
 	return newClientWithConn(gw, conn)
 }
 
+// NewClient returns a new APNS client given a TLS cert & key (in plain text)
 func NewClient(gw string, cert string, key string) (Client, error) {
 	conn, err := NewConn(gw, cert, key)
 	if err != nil {
@@ -63,6 +77,7 @@ func NewClient(gw string, cert string, key string) (Client, error) {
 	return newClientWithConn(gw, conn), nil
 }
 
+// NewClientWithFiles returns a new APNS client given a TLS cert & key files
 func NewClientWithFiles(gw string, certFile string, keyFile string) (Client, error) {
 	conn, err := NewConnWithFiles(gw, certFile, keyFile)
 	if err != nil {
@@ -72,11 +87,14 @@ func NewClientWithFiles(gw string, certFile string, keyFile string) (Client, err
 	return newClientWithConn(gw, conn), nil
 }
 
+// Send gets the client to send a push notification
 func (c *Client) Send(n Notification) error {
 	c.notifs <- n
 	return nil
 }
 
+// reportFailedPush is called whenever we found a failed notification in buffer
+// it will push the failed notification to the client's FailedNotifs
 func (c *Client) reportFailedPush(v interface{}, err *Error) {
 	failedNotif, ok := v.(Notification)
 	if !ok || v == nil {
@@ -89,6 +107,8 @@ func (c *Client) reportFailedPush(v interface{}, err *Error) {
 	}
 }
 
+
+// requeue puts notifications that appear after the cursor back into work queue
 func (c *Client) requeue(cursor *list.Element) {
 	// If `cursor` is not nil, this means there are notifications that
 	// need to be delivered (or redelivered)
@@ -99,6 +119,8 @@ func (c *Client) requeue(cursor *list.Element) {
 	}
 }
 
+// handleError is called whenever we found an error for failed push notification
+// we will report the error and return the cursor (read pointer to list item) to it
 func (c *Client) handleError(err *Error, buffer *buffer) *list.Element {
 	cursor := buffer.Back()
 
@@ -122,8 +144,10 @@ func (c *Client) handleError(err *Error, buffer *buffer) *list.Element {
 	return cursor
 }
 
+// runLoop is a goroutine that will continiously run with a client
+// it will list for new Send request, as well as failed notification
 func (c *Client) runLoop() {
-	sent := newBuffer(50)
+	sent := newBuffer(defBufferSiZe)
 	cursor := sent.Front()
 
 	// APNS connection
@@ -171,10 +195,10 @@ func (c *Client) runLoop() {
 
 			// Set identifier if not specified
 			if n.Identifier == 0 {
-				n.Identifier = c.id
-				c.id++
+				n.Identifier = c.id // c.id belongs to the current notification
+				c.id++              // no race-condition due to single-thread access
 			} else if c.id < n.Identifier {
-				c.id = n.Identifier + 1
+				c.id = n.Identifier + 1 // next notification
 			}
 
 			b, err := n.ToBinary()
@@ -200,6 +224,8 @@ func (c *Client) runLoop() {
 	}
 }
 
+// readErrs  read the first 6 bytes from the connection & push an error to a channel
+// if the bytes indicates an error
 func readErrs(c *Conn) chan error {
 	errs := make(chan error)
 
